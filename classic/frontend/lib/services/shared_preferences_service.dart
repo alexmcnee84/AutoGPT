@@ -103,4 +103,9 @@ class SharedPreferencesService {
     final prefs = await _prefs;
     return prefs.getStringList(key);
   }
+
+  Future<void> remove(String key) async {
+    final prefs = await _prefs;
+    await prefs.remove(key);
+  }
 }

@@ -14,6 +14,7 @@ import 'package:auto_gpt_flutter_client/viewmodels/chat_viewmodel.dart';
 import 'package:auto_gpt_flutter_client/viewmodels/skill_tree_viewmodel.dart';
 
 import 'package:auto_gpt_flutter_client/services/chat_service.dart';
+import 'package:auto_gpt_flutter_client/services/conversation_history_service.dart';
 import 'package:auto_gpt_flutter_client/services/task_service.dart';
 import 'package:auto_gpt_flutter_client/services/benchmark_service.dart';
 
@@ -46,6 +47,10 @@ void main() async {
         ProxyProvider<RestApiUtility, ChatService>(
           update: (context, restApiUtility, chatService) =>
               ChatService(restApiUtility),
+        ),
+        ProxyProvider<SharedPreferencesService, ConversationHistoryService>(
+          update: (context, prefsService, historyService) =>
+              ConversationHistoryService(prefsService),
         ),
         ProxyProvider2<RestApiUtility, SharedPreferencesService, TaskService>(
           update: (context, restApiUtility, prefsService, taskService) =>
@@ -102,6 +107,8 @@ class MyApp extends StatelessWidget {
                   create: (context) => ChatViewModel(
                     Provider.of<ChatService>(context, listen: false),
                     Provider.of<SharedPreferencesService>(context,
+                        listen: false),
+                    Provider.of<ConversationHistoryService>(context,
                         listen: false),
                   ),
                 ),
