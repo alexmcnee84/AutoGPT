@@ -1,6 +1,13 @@
+import 'dart:io' as io;
+import 'dart:typed_data';
+
+import 'package:auto_gpt_flutter_client/models/attachment.dart';
 import 'package:auto_gpt_flutter_client/viewmodels/chat_viewmodel.dart';
 import 'package:auto_gpt_flutter_client/views/chat/continuous_mode_dialog.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:shared_preferences/shared_preferences.dart';
 
 class ChatInputField extends StatefulWidget {
@@ -28,10 +35,13 @@ class _ChatInputFieldState extends State<ChatInputField> {
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
   final FocusNode _throwawayFocusNode = FocusNode();
+  final stt.SpeechToText _speechToText = stt.SpeechToText();
+  bool _isListening = false;
 
   @override
   void initState() {
     super.initState();
+    widget.viewModel.addListener(_handleViewModelUpdated);
     _focusNode.addListener(() {
       if (_focusNode.hasFocus && widget.isContinuousMode) {
         widget.onContinuousModePressed();
@@ -42,7 +52,15 @@ class _ChatInputFieldState extends State<ChatInputField> {
   @override
   void dispose() {
     _focusNode.dispose(); // Dispose of the FocusNode when you're done.
+    widget.viewModel.removeListener(_handleViewModelUpdated);
+    _speechToText.stop();
     super.dispose();
+  }
+
+  void _handleViewModelUpdated() {
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   Future<void> _presentContinuousModeDialogIfNeeded() async {
@@ -74,11 +92,86 @@ class _ChatInputFieldState extends State<ChatInputField> {
 
   void _executeContinuousMode() {
     if (!widget.isContinuousMode) {
-      widget.onSendPressed(_controller.text);
-      _controller.clear();
-      _focusNode.unfocus();
+      if (_canSend()) {
+        widget.onSendPressed(_controller.text);
+        _controller.clear();
+        _focusNode.unfocus();
+      }
     }
     widget.onContinuousModePressed();
+  }
+
+  bool _canSend() {
+    final trimmed = _controller.text.trim();
+    return trimmed.isNotEmpty || widget.viewModel.pendingAttachments.isNotEmpty;
+  }
+
+  Future<void> _handleFileSelection() async {
+    final result = await FilePicker.platform
+        .pickFiles(allowMultiple: true, withData: true);
+    if (result == null) {
+      return;
+    }
+
+    for (final file in result.files) {
+      Uint8List? bytes = file.bytes;
+      if (bytes == null && !kIsWeb && file.path != null) {
+        bytes = await io.File(file.path!).readAsBytes();
+      }
+
+      if (bytes == null) {
+        continue;
+      }
+
+      final attachment = Attachment(
+        name: file.name,
+        mimeType: file.mimeType ?? 'application/octet-stream',
+        bytes: bytes,
+      );
+
+      widget.viewModel.addAttachment(attachment);
+    }
+  }
+
+  Future<void> _handleVoiceInput() async {
+    if (!_isListening) {
+      final available = await _speechToText.initialize(
+        onStatus: (status) {
+          if (status == 'notListening' || status == 'done') {
+            setState(() {
+              _isListening = false;
+            });
+          }
+        },
+        onError: (error) {
+          setState(() {
+            _isListening = false;
+          });
+        },
+      );
+
+      if (available) {
+        setState(() {
+          _isListening = true;
+        });
+        await _speechToText.listen(onResult: (result) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _controller.text = result.recognizedWords;
+            _controller.selection = TextSelection.fromPosition(
+              TextPosition(offset: _controller.text.length),
+            );
+          });
+        });
+      }
+    } else {
+      await _speechToText.stop();
+      setState(() {
+        _isListening = false;
+      });
+    }
   }
 
   @override
@@ -108,62 +201,102 @@ class _ChatInputFieldState extends State<ChatInputField> {
             border: Border.all(color: Colors.black, width: 0.5),
             borderRadius: BorderRadius.circular(8),
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          // Using SingleChildScrollView to ensure the TextField can scroll
-          // when the content exceeds its maximum height
-          child: SingleChildScrollView(
-            reverse: true,
-            child: TextField(
-              controller: _controller,
-              focusNode: _focusNode,
-              // Enable enter key stroke to send the message
-              onSubmitted: (_) {
-                widget.onSendPressed(_controller.text);
-                _controller.clear();
-              },
-              // Allowing the TextField to expand vertically and accommodate multiple lines
-              maxLines: null,
-              decoration: InputDecoration(
-                hintText: 'Type a message...',
-                border: InputBorder.none,
-                suffixIcon: Row(
-                  mainAxisSize: MainAxisSize.min, // Set to minimum space
-                  children: [
-                    if (!widget.isContinuousMode)
-                      Tooltip(
-                        message: 'Send a single message',
-                        child: IconButton(
-                          splashRadius: 0.1,
-                          icon: const Icon(Icons.send),
-                          onPressed: () {
-                            widget.onSendPressed(_controller.text);
-                            _controller.clear();
-                          },
-                        ),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (widget.viewModel.pendingAttachments.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8.0),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: widget.viewModel.pendingAttachments
+                        .map(
+                          (attachment) => InputChip(
+                            label: Text(attachment.name),
+                            onDeleted: () {
+                              widget.viewModel.removeAttachment(attachment);
+                            },
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ),
+              Expanded(
+                child: SingleChildScrollView(
+                  reverse: true,
+                  child: TextField(
+                    controller: _controller,
+                    focusNode: _focusNode,
+                    onSubmitted: (_) {
+                      if (_canSend()) {
+                        widget.onSendPressed(_controller.text);
+                        _controller.clear();
+                      }
+                    },
+                    maxLines: null,
+                    decoration: InputDecoration(
+                      hintText: 'Type a message, upload a file, or use voice...',
+                      border: InputBorder.none,
+                      suffixIcon: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Tooltip(
+                            message: 'Attach files',
+                            child: IconButton(
+                              icon: const Icon(Icons.attach_file),
+                              onPressed: _handleFileSelection,
+                            ),
+                          ),
+                          Tooltip(
+                            message: _isListening
+                                ? 'Stop voice input'
+                                : 'Start voice input',
+                            child: IconButton(
+                              icon: Icon(
+                                  _isListening ? Icons.stop : Icons.mic),
+                              onPressed: _handleVoiceInput,
+                            ),
+                          ),
+                          if (!widget.isContinuousMode)
+                            Tooltip(
+                              message: 'Send a single message',
+                              child: IconButton(
+                                icon: const Icon(Icons.send),
+                                onPressed: () {
+                                  if (_canSend()) {
+                                    widget.onSendPressed(_controller.text);
+                                    _controller.clear();
+                                  }
+                                },
+                              ),
+                            ),
+                          Tooltip(
+                            message: widget.isContinuousMode
+                                ? ''
+                                : 'Enable continuous mode',
+                            child: IconButton(
+                              icon: Icon(widget.isContinuousMode
+                                  ? Icons.pause
+                                  : Icons.fast_forward),
+                              onPressed: () {
+                                if (!widget.isContinuousMode) {
+                                  _presentContinuousModeDialogIfNeeded();
+                                } else {
+                                  widget.onContinuousModePressed();
+                                }
+                              },
+                            ),
+                          ),
+                        ],
                       ),
-                    Tooltip(
-                      message: widget.isContinuousMode
-                          ? ''
-                          : 'Enable continuous mode',
-                      child: IconButton(
-                        splashRadius: 0.1,
-                        icon: Icon(widget.isContinuousMode
-                            ? Icons.pause
-                            : Icons.fast_forward),
-                        onPressed: () {
-                          // TODO: All of this logic should be handled at a higher level in the widget tree. Temporary
-                          if (!widget.isContinuousMode) {
-                            _presentContinuousModeDialogIfNeeded();
-                          } else {
-                            widget.onContinuousModePressed();
-                          }
-                        },
-                      ),
-                    )
-                  ],
+                    ),
+                  ),
                 ),
               ),
-            ),
+            ],
           ),
         );
       },

@@ -4,6 +4,7 @@ import 'package:auto_gpt_flutter_client/viewmodels/task_queue_viewmodel.dart';
 import 'package:auto_gpt_flutter_client/viewmodels/task_viewmodel.dart';
 import 'package:auto_gpt_flutter_client/views/chat/agent_message_tile.dart';
 import 'package:auto_gpt_flutter_client/views/chat/chat_input_field.dart';
+import 'package:auto_gpt_flutter_client/views/chat/conversation_history_log.dart';
 import 'package:auto_gpt_flutter_client/views/chat/loading_indicator.dart';
 import 'package:auto_gpt_flutter_client/views/chat/user_message_tile.dart';
 import 'package:flutter/material.dart';
@@ -68,6 +69,10 @@ class _ChatViewState extends State<ChatView> {
     return Scaffold(
       body: Column(
         children: [
+          ConversationHistoryLog(
+            entries: widget.viewModel.conversationHistory,
+            onClear: () => widget.viewModel.clearConversationHistory(),
+          ),
           // Chat messages list
           Expanded(
             child: ListView.builder(
@@ -113,20 +118,30 @@ class _ChatViewState extends State<ChatView> {
             padding: const EdgeInsets.all(8.0),
             child: ChatInputField(
               onSendPressed: (message) async {
+                if (message.trim().isEmpty &&
+                    widget.viewModel.pendingAttachments.isEmpty) {
+                  return;
+                }
                 widget.viewModel.addTemporaryMessage(message);
                 try {
+                  final resolvedMessage =
+                      message.trim().isEmpty &&
+                              widget.viewModel.pendingAttachments.isNotEmpty
+                          ? '[File Upload]'
+                          : message;
                   if (widget.viewModel.currentTaskId != null) {
                     widget.viewModel.sendChatMessage(
-                        message,
+                        resolvedMessage,
                         continuousModeSteps: Provider.of<SettingsViewModel>(
                                 context,
                                 listen: false)
                             .continuousModeSteps);
                   } else {
-                    String newTaskId = await taskViewModel.createTask(message);
+                    String newTaskId =
+                        await taskViewModel.createTask(resolvedMessage);
                     widget.viewModel.setCurrentTaskId(newTaskId);
                     widget.viewModel.sendChatMessage(
-                        message,
+                        resolvedMessage,
                         continuousModeSteps: Provider.of<SettingsViewModel>(
                                 context,
                                 listen: false)

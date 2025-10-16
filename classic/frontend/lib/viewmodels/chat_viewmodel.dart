@@ -1,23 +1,32 @@
+import 'package:auto_gpt_flutter_client/models/attachment.dart';
+import 'package:auto_gpt_flutter_client/models/chat.dart';
+import 'package:auto_gpt_flutter_client/models/conversation_history_entry.dart';
+import 'package:auto_gpt_flutter_client/models/message_type.dart';
 import 'package:auto_gpt_flutter_client/models/step.dart';
 import 'package:auto_gpt_flutter_client/models/step_request_body.dart';
+import 'package:auto_gpt_flutter_client/services/chat_service.dart';
+import 'package:auto_gpt_flutter_client/services/conversation_history_service.dart';
 import 'package:auto_gpt_flutter_client/services/shared_preferences_service.dart';
 import 'package:flutter/foundation.dart';
-import 'package:auto_gpt_flutter_client/services/chat_service.dart';
-import 'package:auto_gpt_flutter_client/models/chat.dart';
-import 'package:auto_gpt_flutter_client/models/message_type.dart';
 
 class ChatViewModel with ChangeNotifier {
   final ChatService _chatService;
+  final SharedPreferencesService _prefsService;
+  final ConversationHistoryService _historyService;
+
   List<Chat> _chats = [];
   String? _currentTaskId;
-  final SharedPreferencesService _prefsService;
+  final List<Attachment> _pendingAttachments = [];
+  List<ConversationHistoryEntry> _conversationHistory = [];
 
   bool _isWaitingForAgentResponse = false;
+  bool _isContinuousMode = false;
+
+  ChatViewModel(
+      this._chatService, this._prefsService, this._historyService);
 
   bool get isWaitingForAgentResponse => _isWaitingForAgentResponse;
   SharedPreferencesService get prefsService => _prefsService;
-
-  bool _isContinuousMode = false;
 
   bool get isContinuousMode => _isContinuousMode;
   set isContinuousMode(bool value) {
@@ -25,54 +34,50 @@ class ChatViewModel with ChangeNotifier {
     notifyListeners();
   }
 
-  ChatViewModel(this._chatService, this._prefsService);
-
-  /// Returns the current list of chats.
   List<Chat> get chats => _chats;
-
   String? get currentTaskId => _currentTaskId;
+
+  List<Attachment> get pendingAttachments =>
+      List.unmodifiable(_pendingAttachments);
+
+  List<ConversationHistoryEntry> get conversationHistory =>
+      List.unmodifiable(_conversationHistory);
 
   void setCurrentTaskId(String taskId) {
     if (_currentTaskId != taskId) {
       _currentTaskId = taskId;
       fetchChatsForTask();
+      _loadConversationHistory();
     }
   }
 
   void clearCurrentTaskAndChats() {
     _currentTaskId = null;
     _chats.clear();
-    notifyListeners(); // Notify listeners to rebuild UI
+    _pendingAttachments.clear();
+    _conversationHistory = [];
+    notifyListeners();
   }
 
-  /// Fetches chats from the data source for a specific task.
-  void fetchChatsForTask() async {
+  Future<void> fetchChatsForTask() async {
     if (_currentTaskId == null) {
       print("Error: Task ID is not set.");
       return;
     }
     try {
-      // Fetch task steps from the data source
       final Map<String, dynamic> stepsResponse =
           await _chatService.listTaskSteps(_currentTaskId!, pageSize: 10000);
 
-      // Extract steps from the response
       final List<dynamic> stepsJsonList = stepsResponse['steps'] ?? [];
-
-      // Convert each map into a Step object
       List<Step> steps =
           stepsJsonList.map((stepMap) => Step.fromMap(stepMap)).toList();
 
-      // Initialize an empty list to store Chat objects
       List<Chat> chats = [];
-
-      // Generate current timestamp
       DateTime currentTimestamp = DateTime.now();
 
       for (int i = 0; i < steps.length; i++) {
         Step step = steps[i];
 
-        // Create a Chat object for 'input' if it exists and is not empty
         if (step.input.isNotEmpty) {
           chats.add(Chat(
               id: step.stepId,
@@ -83,7 +88,6 @@ class ChatViewModel with ChangeNotifier {
               artifacts: step.artifacts));
         }
 
-        // Create a Chat object for 'output'
         chats.add(Chat(
             id: step.stepId,
             taskId: step.taskId,
@@ -94,44 +98,73 @@ class ChatViewModel with ChangeNotifier {
             artifacts: step.artifacts));
       }
 
-      // Assign the chats list
-      if (chats.length > 0) {
+      if (chats.isNotEmpty) {
         _chats = chats;
       }
 
-      // Notify listeners to rebuild UI
+      await _loadConversationHistory(seedChats: chats);
+
       notifyListeners();
 
       print(
           "Chats (and steps) fetched successfully for task ID: $_currentTaskId");
     } catch (error) {
       print("Error fetching chats: $error");
-      // TODO: Handle additional error scenarios or log them as required
     }
   }
 
-  /// Sends a chat message for a specific task.
-  void sendChatMessage(String message,
+  Future<void> sendChatMessage(String message,
       {required int continuousModeSteps, int currentStep = 1}) async {
     if (_currentTaskId == null) {
       print("Error: Task ID is not set.");
       return;
     }
+
+    final trimmedMessage = message.trim();
+    if (trimmedMessage.isEmpty && _pendingAttachments.isEmpty) {
+      return;
+    }
+
+    final String outgoingMessage =
+        trimmedMessage.isEmpty ? '[File Upload]' : trimmedMessage;
+
+    final ConversationHistoryEntry userHistoryEntry =
+        ConversationHistoryEntry(
+      messageType: MessageType.user,
+      message: outgoingMessage,
+      timestamp: DateTime.now(),
+      attachments: List.from(_pendingAttachments),
+    );
+
+    final List<Map<String, dynamic>> conversationPayload = [
+      ..._conversationHistory
+          .map((entry) => entry.toPayloadJson(includeAttachmentData: false)),
+      userHistoryEntry.toPayloadJson(includeAttachmentData: true),
+    ];
+
+    final Map<String, dynamic> additionalInput = {
+      'conversation_history': conversationPayload,
+    };
+
+    if (_pendingAttachments.isNotEmpty) {
+      additionalInput['attachments'] =
+          _pendingAttachments.map((attachment) => attachment.toJson()).toList();
+    }
+
     _isWaitingForAgentResponse = true;
     notifyListeners();
 
     try {
-      // Create the request body for executing the step
-      StepRequestBody requestBody = StepRequestBody(input: message);
+      StepRequestBody requestBody = StepRequestBody(
+        input: outgoingMessage,
+        additionalInput: additionalInput,
+      );
 
-      // Execute the step and get the response
       Map<String, dynamic> executedStepResponse =
           await _chatService.executeStep(_currentTaskId!, requestBody);
 
-      // Create a Chat object from the returned step
       Step executedStep = Step.fromMap(executedStepResponse);
 
-      // Create a Chat object for the user message
       if (executedStep.input.isNotEmpty) {
         final userChat = Chat(
             id: executedStep.stepId,
@@ -144,7 +177,6 @@ class ChatViewModel with ChangeNotifier {
         _chats.add(userChat);
       }
 
-      // Create a Chat object for the agent message
       final agentChat = Chat(
           id: executedStep.stepId,
           taskId: executedStep.taskId,
@@ -156,16 +188,26 @@ class ChatViewModel with ChangeNotifier {
 
       _chats.add(agentChat);
 
-      // Remove the temporary message
       removeTemporaryMessage();
 
-      // Notify UI of the new chats
+      _pendingAttachments.clear();
+
+      final ConversationHistoryEntry agentHistoryEntry =
+          ConversationHistoryEntry(
+        messageType: MessageType.agent,
+        message: agentChat.message,
+        timestamp: agentChat.timestamp,
+      );
+
+      _conversationHistory.addAll([userHistoryEntry, agentHistoryEntry]);
+      await _historyService.saveHistory(_currentTaskId!, _conversationHistory);
+
       notifyListeners();
 
       if (_isContinuousMode && !executedStep.isLast) {
         print("Continuous Mode: Step $currentStep of $continuousModeSteps");
         if (currentStep < continuousModeSteps) {
-          sendChatMessage("",
+          await sendChatMessage("",
               continuousModeSteps: continuousModeSteps,
               currentStep: currentStep + 1);
         } else {
@@ -175,11 +217,8 @@ class ChatViewModel with ChangeNotifier {
 
       print("Chats added for task ID: $_currentTaskId");
     } catch (e) {
-      // Remove the temporary message in case of an error
       removeTemporaryMessage();
-      // TODO: We are bubbling up the full response. Revisit this.
       rethrow;
-      // TODO: Handle additional error scenarios or log them as required
     } finally {
       _isWaitingForAgentResponse = false;
       notifyListeners();
@@ -187,11 +226,18 @@ class ChatViewModel with ChangeNotifier {
   }
 
   void addTemporaryMessage(String message) {
+    final trimmedMessage = message.trim();
+    if (trimmedMessage.isEmpty && _pendingAttachments.isEmpty) {
+      return;
+    }
+    final displayMessage = trimmedMessage.isNotEmpty
+        ? trimmedMessage
+        : 'Sent ${_pendingAttachments.length} attachment(s).';
+
     Chat tempMessage = Chat(
-        // You can generate a unique ID or use a placeholder
         id: "TEMP_ID",
         taskId: "TEMP_ID",
-        message: message,
+        message: displayMessage,
         timestamp: DateTime.now(),
         messageType: MessageType.user,
         artifacts: []);
@@ -205,19 +251,58 @@ class ChatViewModel with ChangeNotifier {
     notifyListeners();
   }
 
-  /// Downloads an artifact associated with a specific chat.
-  ///
-  /// [taskId] is the ID of the task.
-  /// [artifactId] is the ID of the artifact to be downloaded.
+  void addAttachment(Attachment attachment) {
+    _pendingAttachments.add(attachment);
+    notifyListeners();
+  }
+
+  void removeAttachment(Attachment attachment) {
+    _pendingAttachments.remove(attachment);
+    notifyListeners();
+  }
+
+  Future<void> clearConversationHistory() async {
+    if (_currentTaskId == null) {
+      return;
+    }
+    await _historyService.clearHistory(_currentTaskId!);
+    _conversationHistory = [];
+    notifyListeners();
+  }
+
+  Future<void> _loadConversationHistory({List<Chat>? seedChats}) async {
+    if (_currentTaskId == null) {
+      return;
+    }
+
+    final history = await _historyService.loadHistory(_currentTaskId!);
+    if (history.isNotEmpty) {
+      _conversationHistory = history;
+      return;
+    }
+
+    if (seedChats != null && seedChats.isNotEmpty) {
+      _conversationHistory = seedChats
+          .map(
+            (chat) => ConversationHistoryEntry(
+              messageType: chat.messageType,
+              message: chat.message,
+              timestamp: chat.timestamp,
+            ),
+          )
+          .toList();
+      await _historyService.saveHistory(_currentTaskId!, _conversationHistory);
+    } else {
+      _conversationHistory = [];
+    }
+  }
+
   Future<void> downloadArtifact(String taskId, String artifactId) async {
     try {
-      // Call the downloadArtifact method from the ChatService class
       await _chatService.downloadArtifact(taskId, artifactId);
-
       print("Artifact $artifactId downloaded successfully for task $taskId!");
     } catch (error) {
       print("Error downloading artifact: $error");
-      // TODO: Handle the error appropriately, perhaps notify the user
     }
   }
 }
